@@ -32,6 +32,7 @@ IPXE_ENV = \
 	AWK=/usr/bin/nawk \
 	GREP=/usr/xpg4/bin/grep \
 	GITVERSION= \
+	DEBUG=multiboot2 \
 	V=1
 
 TAR =		/usr/bin/gtar

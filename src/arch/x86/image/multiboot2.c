@@ -608,9 +608,10 @@ static ssize_t multiboot2_build_mmap ( struct image *image,
 		multiboot_uint32_t mt = convert_efi_type ( d->Type );
 		struct multiboot_mmap_entry *me = &mmap[nr];
 
-		DBGC ( image, "EM[%zd]: PhysicalStart 0x%llx "
-		       "NumberOfPages %lld Type 0x%d\n", i, d->PhysicalStart,
-		       d->NumberOfPages, d->Type );
+		DBGC ( image, "EM[%zd]: 0x%llx-0x%llx Type 0x%d\n", i,
+			d->PhysicalStart,
+			d->PhysicalStart + EFI_PAGE_SIZE * d->NumberOfPages,
+			d->Type );
 
 		if ( lastme != NULL && mt == lastme->type &&
 			d->PhysicalStart == lastme->addr + lastme->len ) {
@@ -745,7 +746,10 @@ static int multiboot2_check_mmap ( struct mb2 *mb2 ) {
 
 /*
  * We just need a small unused region that we're definitely not going to copy
- * the kernel over during the bounce to kernel.
+ * the kernel over during the bounce to kernel. Unfortunately, on many Dell
+ * systems, boot services have allocated all of the region below the kernel. In
+ * this case, we'll try an unbounded allocation, in the hope that we're not
+ * going to later clash with our kernel load area.
  */
 static struct mb2 *multiboot2_alloc_bounce_buffer ( struct mb2 *mb2 ) {
 	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
@@ -755,14 +759,22 @@ static struct mb2 *multiboot2_alloc_bounce_buffer ( struct mb2 *mb2 ) {
 	int efirc;
 	char *p;
 
+	printf ( "JLEVON 1\n");
 	if ( ( efirc = bs->AllocatePages ( AllocateMaxAddress,
-		EfiBootServicesData, EFI_SIZE_TO_PAGES ( size ),
+		EfiLoaderData, EFI_SIZE_TO_PAGES ( size ),
 		&phys_addr ) ) != 0 ) {
-		printf ( "MULTIBOOT2 could not allocate 0x%zx bytes: %s\n",
-		      size, strerror ( -EEFI ( efirc ) ) );
-		return NULL;
-	}
+		if ( ( efirc = bs->AllocatePages ( AllocateAnyPages,
+			EfiLoaderData, EFI_SIZE_TO_PAGES ( size ),
+			&phys_addr ) ) != 0 ) {
+			printf ( "MULTIBOOT2 could not allocate bounce buffer: %s\n",
+			      strerror ( -EEFI ( efirc ) ) );
+			return NULL;
+		}
+	} // FIXME
 
+	DBGC ( mb2->image, "bounce is at %llx\n", phys_addr);
+
+	memset ( (void *) phys_to_user ( phys_addr ), 0, size );
 	memcpy_user ( phys_to_user ( phys_addr), 0,
 		      (userptr_t)mb2, 0, sizeof ( *mb2 ) );
 
@@ -808,6 +820,7 @@ again:
 		return -EEFI ( efirc );
 	}
 
+	//DBGC ( mb2->image, "MULTIBOOT2 exit_boot_services done ( )\n");
 	return 0;
 }
 
@@ -829,6 +842,7 @@ static void multiboot2_enter_kernel ( struct mb2 *mb2 ) {
 	char *load_addr = (char *)(intptr_t) mb2->kernel_load_addr;
 	size_t i;
 
+	dbg_printf( "jlevon 2\n");
 	/*
 	 * A lame byte-by-byte implementation, but iPXE's memcpy() does this
 	 * anyway...
@@ -838,10 +852,12 @@ static void multiboot2_enter_kernel ( struct mb2 *mb2 ) {
 			[mb2->kernel_file_offset + i];
 	}
 
+	dbg_printf( "jlevon 3\n");
 	for ( i = 0; i < mb2->kernel_memsz - mb2->kernel_filesz; i++ ) {
 		load_addr[mb2->kernel_filesz + i] = '\0';
 	}
 
+	dbg_printf( "jlevon 4\n");
 	if ( mb2->kernel_entry.type == ENTRY_EFI64 ) {
 		__asm__ __volatile__ ( "push %%rbp\n\t"
 				       "call *%%rdi\n\t"
@@ -889,6 +905,10 @@ static int multiboot2_exec ( struct image *image ) {
 
 	if ( ( mb2 = multiboot2_alloc_bounce_buffer ( mb2 ) ) == NULL )
 		return -ENOMEM;
+
+	DBGC ( image, "jlevon multiboot2_enter_kernel is %p\n", multiboot2_enter_kernel);
+	DBGC ( image, "jlevon multiboot2_bounce is %p\n", multiboot2_bounce);
+	DBGC ( image, "jlevon kernel at 0x%x-0x%zx\n", mb2->kernel_load_addr, mb2->kernel_load_addr + mb2->kernel_filesz);
 
 	total_sizep = BIB_ADDR ( mb2 );
 	mb2->bib_offset += sizeof ( *total_sizep );
@@ -940,6 +960,8 @@ static int multiboot2_exec ( struct image *image ) {
 
 	if ( ( rc = exit_boot_services ( mb2 ) ) != 0 )
 		return rc;
+
+	DBGC ( image, "jlevon 1\n");
 
 	/*
 	 * We have to bounce out and back again: GCC inline asm can't clobber
